@@ -4,6 +4,8 @@ Deepgram live transcription client (deepgram-sdk v6).
 One DeepgramTranscriber per audio stream (mic or BlackHole). Connects via
 WebSocket, streams raw int16 PCM from an asyncio.Queue, parses transcript
 results, and calls the provided async callback for each non-empty result.
+
+Includes automatic reconnection with exponential backoff on connection failures.
 """
 
 import asyncio
@@ -34,15 +36,15 @@ TranscriptCallback = Callable[[TranscriptResult], Awaitable[None]]
 # Keepalive interval in seconds — Deepgram closes idle connections after ~10s
 _KEEPALIVE_INTERVAL = 8.0
 
+# Reconnect settings
+_MAX_RECONNECT_ATTEMPTS = 5
+_RECONNECT_BASE_DELAY = 1.0  # seconds, doubles each attempt
+
 
 class DeepgramTranscriber:
     """
     Manages one Deepgram live transcription WebSocket connection.
-
-    Args:
-        speaker:      Label for transcript lines ("You" or "Interviewer").
-        audio_queue:  asyncio.Queue fed by AudioCapture with raw int16 bytes.
-        on_transcript: Async callback for each non-empty transcript segment.
+    Automatically reconnects on failures with exponential backoff.
     """
 
     def __init__(
@@ -56,7 +58,51 @@ class DeepgramTranscriber:
         self.on_transcript = on_transcript
 
     async def run(self) -> None:
-        """Open Deepgram WebSocket and stream audio until cancelled."""
+        """Open Deepgram WebSocket with auto-reconnect on failures."""
+        attempt = 0
+
+        while True:
+            try:
+                await self._run_connection()
+                # Clean exit (e.g. CancelledError propagated) — don't reconnect
+                return
+            except asyncio.CancelledError:
+                logger.info("[%s] Transcriber cancelled", self.speaker)
+                raise
+            except Exception as exc:
+                attempt += 1
+                if attempt > _MAX_RECONNECT_ATTEMPTS:
+                    logger.error(
+                        "[%s] Max reconnect attempts (%d) reached. Giving up.",
+                        self.speaker,
+                        _MAX_RECONNECT_ATTEMPTS,
+                    )
+                    raise
+
+                delay = _RECONNECT_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "[%s] Connection lost: %s. Reconnecting in %.1fs (attempt %d/%d)...",
+                    self.speaker,
+                    exc,
+                    delay,
+                    attempt,
+                    _MAX_RECONNECT_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
+
+                # Drain stale audio from queue before reconnecting
+                drained = 0
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                        drained += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if drained:
+                    logger.info("[%s] Drained %d stale audio chunks", self.speaker, drained)
+
+    async def _run_connection(self) -> None:
+        """Single Deepgram WebSocket session."""
         api_key = get_deepgram_api_key()
         client = AsyncDeepgramClient(api_key=api_key)
 
@@ -73,46 +119,33 @@ class DeepgramTranscriber:
 
         logger.info("[%s] Connecting to Deepgram WebSocket...", self.speaker)
 
-        try:
-            async with client.listen.v1.connect(**connect_kwargs) as ws:
-                logger.info("[%s] Deepgram connection established", self.speaker)
+        async with client.listen.v1.connect(**connect_kwargs) as ws:
+            logger.info("[%s] Deepgram connection established", self.speaker)
 
-                # Run sender and receiver concurrently
-                send_task = asyncio.create_task(
-                    self._send_loop(ws), name=f"dg-send-{self.speaker}"
-                )
-                recv_task = asyncio.create_task(
-                    self._recv_loop(ws), name=f"dg-recv-{self.speaker}"
-                )
+            # Run sender and receiver concurrently
+            send_task = asyncio.create_task(
+                self._send_loop(ws), name=f"dg-send-{self.speaker}"
+            )
+            recv_task = asyncio.create_task(
+                self._recv_loop(ws), name=f"dg-recv-{self.speaker}"
+            )
 
-                # Wait until one of them finishes (cancelled or error)
-                done, pending = await asyncio.wait(
-                    [send_task, recv_task],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for t in pending:
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            # Wait until one of them finishes (cancelled or error)
+            done, pending = await asyncio.wait(
+                [send_task, recv_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-                # Re-raise if either task raised an unhandled exception
-                for t in done:
-                    if not t.cancelled() and t.exception():
-                        logger.error(
-                            "[%s] Transcriber task error: %s",
-                            self.speaker,
-                            t.exception(),
-                        )
-
-        except asyncio.CancelledError:
-            logger.info("[%s] Transcriber cancelled", self.speaker)
-            raise
-        except Exception as exc:
-            logger.error("[%s] Deepgram connection error: %s", self.speaker, exc, exc_info=True)
-        finally:
-            logger.info("[%s] Deepgram connection closed", self.speaker)
+            # Re-raise if either task raised an unhandled exception
+            for t in done:
+                if not t.cancelled() and t.exception():
+                    raise t.exception()
 
     async def _send_loop(self, ws) -> None:
         """Pull audio chunks from the queue and send to Deepgram."""

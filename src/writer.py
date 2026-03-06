@@ -1,30 +1,34 @@
 """
-Transcript writer.
+Transcript writer with Rich terminal UI.
 
 Two output files:
   - transcript.md: full conversation log (interviewer + you + assistant answers)
-  - answer.md: ONLY the current assistant answer, overwritten each time — this is
-    what you look at during the interview
+  - answer.md: ONLY the current assistant answer, overwritten each time
 """
 
 import logging
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
 
 from src.config import TRANSCRIPT_DIR
 from src.transcriber import TranscriptResult
 
 logger = logging.getLogger(__name__)
 
-# ANSI color codes
-_RESET = "\033[0m"
-_BOLD = "\033[1m"
-_COLOR_YOU = "\033[36m"
-_COLOR_INTERVIEWER = "\033[33m"
-_COLOR_ASSISTANT = "\033[32m"
-_COLOR_INTERIM = "\033[2m"
+console = Console()
+
+# Speaker styles
+_STYLE_YOU = "bold cyan"
+_STYLE_INTERVIEWER = "bold yellow"
+_STYLE_ASSISTANT = "bold green"
+_STYLE_TIMESTAMP = "dim"
+_STYLE_INTERIM = "dim italic"
 
 
 class TranscriptWriter:
@@ -35,7 +39,9 @@ class TranscriptWriter:
         self.transcript_path = TRANSCRIPT_DIR / f"transcript_{ts}.md"
         self.answer_path = TRANSCRIPT_DIR / "answer.md"
         self._transcript_file = None
+        self._answer_file: Optional[object] = None
         self._has_interim_on_screen = False
+        self._current_answer_text = ""
 
     def open(self) -> None:
         self._transcript_file = open(self.transcript_path, "a", encoding="utf-8")
@@ -52,8 +58,10 @@ class TranscriptWriter:
 
     def close(self) -> None:
         if self._has_interim_on_screen:
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
+            console.print()  # newline to clear interim
+        if self._answer_file:
+            self._answer_file.close()
+            self._answer_file = None
         if self._transcript_file:
             self._transcript_file.flush()
             self._transcript_file.close()
@@ -66,20 +74,26 @@ class TranscriptWriter:
         if not text:
             return
 
-        color = _COLOR_YOU if result.speaker == "You" else _COLOR_INTERVIEWER
+        style = _STYLE_YOU if result.speaker == "You" else _STYLE_INTERVIEWER
 
         if not result.is_final:
-            line = f"{color}{_COLOR_INTERIM}[{result.speaker}] {text}...{_RESET}"
-            sys.stdout.write(f"\r\033[K{line}")
-            sys.stdout.flush()
+            # Interim result — show dimmed, overwrite previous
+            line = Text()
+            line.append(f"  ⟩ [{result.speaker}] ", style=_STYLE_INTERIM)
+            line.append(f"{text}...", style=_STYLE_INTERIM)
+            console.print(line, end="\r", overflow="ellipsis")
             self._has_interim_on_screen = True
         else:
             if self._has_interim_on_screen:
-                sys.stdout.write("\r\033[K")
+                console.print(" " * 120, end="\r")  # clear interim line
                 self._has_interim_on_screen = False
 
             ts = datetime.now().strftime("%H:%M:%S")
-            print(f"{_BOLD}{color}[{result.speaker}]{_RESET} {_COLOR_INTERIM}{ts}{_RESET} {text}")
+            line = Text()
+            line.append(f"  [{result.speaker}]", style=style)
+            line.append(f" {ts} ", style=_STYLE_TIMESTAMP)
+            line.append(text)
+            console.print(line)
 
             if self._transcript_file:
                 self._transcript_file.write(f"**[{result.speaker}]** `{ts}` {text}\n")
@@ -90,41 +104,54 @@ class TranscriptWriter:
     def start_answer_block(self) -> None:
         """Called before streaming starts. Clears the answer file."""
         if self._has_interim_on_screen:
-            sys.stdout.write("\r\033[K")
+            console.print(" " * 120, end="\r")
             self._has_interim_on_screen = False
 
         ts = datetime.now().strftime("%H:%M:%S")
 
-        # Terminal: header
-        print(f"\n{_BOLD}{_COLOR_ASSISTANT}[Assistant]{_RESET} {_COLOR_INTERIM}{ts}{_RESET}")
+        # Terminal: divider + header
+        console.print()
+        console.rule("[bold green]Assistant", style="green", align="left")
 
         # Transcript file: header
         if self._transcript_file:
             self._transcript_file.write(f"\n**[Assistant]** `{ts}`\n\n")
             self._transcript_file.flush()
 
-        # Answer file: overwrite with empty — will be filled chunk by chunk
-        self.answer_path.write_text("", encoding="utf-8")
+        # Answer file: open and keep open for the duration of streaming
+        if self._answer_file:
+            self._answer_file.close()
+        self._answer_file = open(self.answer_path, "w", encoding="utf-8")
+        self._current_answer_text = ""
 
     async def handle_answer_chunk(self, text: str) -> None:
         """Append one streaming chunk to both outputs."""
-        # Terminal
-        sys.stdout.write(f"{_COLOR_ASSISTANT}{text}{_RESET}")
-        sys.stdout.flush()
+        self._current_answer_text += text
+
+        # Terminal — print chunk inline
+        console.print(text, end="", style="green", highlight=False)
 
         # Transcript file
         if self._transcript_file:
             self._transcript_file.write(text)
             self._transcript_file.flush()
 
-        # Answer file — append
-        with open(self.answer_path, "a", encoding="utf-8") as f:
-            f.write(text)
+        # Answer file — write and flush (file kept open)
+        if self._answer_file:
+            self._answer_file.write(text)
+            self._answer_file.flush()
 
     async def handle_answer_done(self) -> None:
         """Called when answer streaming is complete."""
-        print(f"\n{_COLOR_INTERIM}{'─' * 60}{_RESET}")
+        console.print()  # newline after streamed text
+        console.rule(style="dim")
+        console.print()
 
         if self._transcript_file:
             self._transcript_file.write("\n\n---\n\n")
             self._transcript_file.flush()
+
+        # Close answer file
+        if self._answer_file:
+            self._answer_file.close()
+            self._answer_file = None
