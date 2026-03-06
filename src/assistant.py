@@ -17,15 +17,11 @@ from src.config import (
     CLAUDE_API_URL,
     CLAUDE_MAX_TOKENS,
     CLAUDE_MODEL,
-    SYSTEM_PROMPT,
     get_anthropic_token,
 )
 from src.transcriber import TranscriptResult
 
 logger = logging.getLogger(__name__)
-
-# How long to wait after last interviewer speech before generating an answer
-_DEBOUNCE_SECONDS = 3.0
 
 # Max conversation turns to keep in context
 _MAX_HISTORY_TURNS = 30
@@ -45,10 +41,14 @@ class InterviewAssistant:
 
     def __init__(
         self,
+        system_prompt: str,
+        debounce_seconds: float,
         on_answer_start: Callable[[], None],
         on_answer_chunk: Callable[[str], Awaitable[None]],
         on_answer_done: Callable[[], Awaitable[None]],
     ):
+        self._system_prompt = system_prompt
+        self._debounce_seconds = debounce_seconds
         self.on_answer_start = on_answer_start
         self.on_answer_chunk = on_answer_chunk
         self.on_answer_done = on_answer_done
@@ -95,7 +95,7 @@ class InterviewAssistant:
 
     async def _debounced_generate(self) -> None:
         try:
-            await asyncio.sleep(_DEBOUNCE_SECONDS)
+            await asyncio.sleep(self._debounce_seconds)
             await self._generate_answer()
         except asyncio.CancelledError:
             pass
@@ -115,7 +115,6 @@ class InterviewAssistant:
                 messages.append({"role": role, "content": text})
 
         # Ensure messages start with user and alternate properly
-        # If first message is assistant, prepend a user message
         if messages and messages[0]["role"] == "assistant":
             messages.insert(0, {"role": "user", "content": "[Interview started]"})
 
@@ -138,7 +137,7 @@ class InterviewAssistant:
         payload = {
             "model": CLAUDE_MODEL,
             "max_tokens": CLAUDE_MAX_TOKENS,
-            "system": SYSTEM_PROMPT,
+            "system": self._system_prompt,
             "messages": messages,
             "stream": True,
         }
